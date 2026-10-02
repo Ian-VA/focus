@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 authors = [
-    { name = "ian", email = "minedragocraft@gmail.com" }
+    { name = "Ian Atroshchenko", email = "ianatroshchenko@gmail.com" }
 ]
 requires-python = ">=3.11"
 dependencies = [
@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-focus = "focus:main"
+focus = "focus.main:app"
 
 [build-system]
 requires = ["uv_build>=0.12.22,<0.13.0"]

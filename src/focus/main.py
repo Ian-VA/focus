@@ -1,4 +1,5 @@
 import typer
+from rich import print
 
 
 app = typer.Typer()
@@ -6,7 +7,7 @@ app = typer.Typer()
 
 @app.callback()
 def callback():
-
+    pass
 
 @app.command()
 def hello(name: str):
@@ -15,6 +16,3 @@ def hello(name: str):
 @app.command()
 def goodbye(name: str):
     print("Goodbye!")
-
-if __name__ == "__main__":
-    app()
