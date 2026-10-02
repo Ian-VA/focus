@@ -8,6 +8,13 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
+    "anthropic>=1.11.0",
+    "mss>=10.2.0",
+    "openai>=3.23.0",
+    "pillow>=12.3.0",
+    "psutil>=7.2.2",
+    "pyfiglet>=1.0.4",
+    "python-xlib>=0.33 ; sys_platform == 'linux'",
     "typer>=0.27.2",
 ]
 
