@@ -9,7 +9,7 @@ from Xlib.error import XError
 from Xlib.ext import xtest
 from Xlib.protocol import event
 
-from focus.tools.platform.base import Platform, PlatformError, WindowInfo, grab_monitors
+from focus.tools.platform.base import Platform, PlatformError, WindowInfo
 
 
 class LinuxPlatform(Platform):
@@ -47,7 +47,11 @@ class X11Platform(LinuxPlatform):
         self._root = self._display.screen().root
 
     def grab_screens(self) -> list[Image.Image]:
-        return grab_monitors(self._screen_grabber)
+        monitors = self._screen_grabber.monitors
+        return [
+            Image.frombytes("RGB", shot.size, shot.rgb)
+            for shot in map(self._screen_grabber.grab, monitors[1:] or monitors[:1])
+        ]
 
     def grab_window(self, window_id: str) -> Image.Image:
         window = self._display.create_resource_object("window", int(window_id, 16))

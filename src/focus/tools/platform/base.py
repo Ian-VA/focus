@@ -4,7 +4,6 @@ from abc import ABC, abstractmethod
 from contextlib import suppress
 from dataclasses import dataclass
 
-import mss
 import psutil
 from PIL import Image
 
@@ -56,6 +55,10 @@ class Platform(ABC):
     @abstractmethod
     def send_close_tab_shortcut(self) -> None:
         """press the OS's close-tab shortcut (ctrl+w, cmd+w, ...) in the focused window"""
+
+    def check_permissions(self) -> None:
+        """ask the OS for whatever access Focus needs before a session starts. raises
+        PlatformError when the user has to do something and run Focus again"""
 
     def focused_window(self) -> WindowInfo | None:
         return next((window for window in self.list_windows() if window.focused), None)
@@ -139,14 +142,6 @@ class UnsupportedPlatform(Platform):
 
     def send_close_tab_shortcut(self):
         self._unsupported()
-
-
-def grab_monitors(grabber: mss.MSS) -> list[Image.Image]:
-    monitors = grabber.monitors
-    return [
-        Image.frombytes("RGB", shot.size, shot.rgb)
-        for shot in map(grabber.grab, monitors[1:] or monitors[:1])
-    ]
 
 
 def _labels(procs: list[psutil.Process]) -> list[str]:

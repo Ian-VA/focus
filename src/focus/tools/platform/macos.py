@@ -1,14 +1,19 @@
 import os
 import tempfile
 import time
+from collections.abc import Callable
 
-import mss
 import Quartz
 from AppKit import NSApplicationActivateIgnoringOtherApps, NSRunningApplication, NSWorkspace
-from mss.exception import ScreenShotError
+from ApplicationServices import (
+    AXIsProcessTrusted,
+    AXIsProcessTrustedWithOptions,
+    kAXTrustedCheckOptionPrompt,
+)
 from PIL import Image
 
-from focus.tools.platform.base import Platform, PlatformError, WindowInfo, grab_monitors
+from focus.tools.platform.base import Platform, PlatformError, WindowInfo
+from focus.utils.log import log, warn
 
 PERMISSIONS = "System Settings > Privacy & Security"
 SCREEN_RECORDING_HINT = (
@@ -17,6 +22,12 @@ SCREEN_RECORDING_HINT = (
 ACCESSIBILITY_HINT = (
     f"grant the terminal running Focus Accessibility access in {PERMISSIONS} > Accessibility"
 )
+SETTINGS_PANES = {
+    "screen_recording": "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+    "accessibility": "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+}
+PERMISSION_WAIT_SECONDS = 180
+MAX_DISPLAYS = 16
 
 ACTIVATE_WINDOW_SCRIPT = """
 on run argv
@@ -50,7 +61,12 @@ end run
 
 
 class MacOSPlatform(Platform):
-    """screenshots via mss and screencapture, window management via Quartz and AppleScript"""
+    """
+    screenshots via the screencapture utility, window management via Quartz and AppleScript.
+
+    every capture runs in a fresh process so that Screen Recording access, once granted
+    to the terminal, applies immediately instead of after the terminal is relaunched
+    """
 
     name = "macOS"
 
@@ -60,28 +76,57 @@ class MacOSPlatform(Platform):
         "cfprefsd distnoted securityd sshd universalaccessd".split()
     )
 
-    def __init__(self):
-        try:
-            self._screen_grabber = mss.MSS()
-        except ScreenShotError as e:
-            raise PlatformError(f"couldn't access the display: {e}. {SCREEN_RECORDING_HINT}") from e
+    def check_permissions(self) -> None:
+        if not self._screen_recording_allowed():
+            log("Focus needs Screen Recording access to see your screen")
+            Quartz.CGRequestScreenCaptureAccess()
+            self._open_settings("screen_recording")
+            log(
+                f"turn it on for your terminal app in {PERMISSIONS} > Screen Recording. "
+                "waiting for that... (ctrl+c to give up)"
+            )
+            try:
+                granted = _wait_for(self._screen_recording_allowed)
+            except KeyboardInterrupt:
+                granted = False
+            if not granted:
+                raise PlatformError(
+                    "Screen Recording access hasn't been enabled yet. turn it on, then quit and "
+                    "reopen your terminal app and run focus again"
+                )
+            log("Screen Recording access granted")
+
+        if not AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True}):
+            log("Focus needs Accessibility access to close tabs and switch windows")
+            log(
+                f"turn it on for your terminal app in {PERMISSIONS} > Accessibility. "
+                "waiting for that... (ctrl+c to continue without it)"
+            )
+            try:
+                granted = _wait_for(AXIsProcessTrusted)
+            except KeyboardInterrupt:
+                granted = False
+            if granted:
+                log("Accessibility access granted")
+            else:
+                warn("continuing without Accessibility access; close_tab won't work until it's enabled")
 
     def grab_screens(self) -> list[Image.Image]:
+        paths = [_temp_png() for _ in range(self._display_count())]
         try:
-            return grab_monitors(self._screen_grabber)
-        except ScreenShotError as e:
-            raise PlatformError(f"screen capture failed: {e}. {SCREEN_RECORDING_HINT}") from e
+            self._capture("-x", *paths)
+            return [_load(path) for path in paths if os.path.getsize(path)]
+        finally:
+            for path in paths:
+                os.unlink(path)
 
     def grab_window(self, window_id: str) -> Image.Image:
-        fd, path = tempfile.mkstemp(prefix="focus-", suffix=".png")
-        os.close(fd)
+        path = _temp_png()
         try:
-            self._run("screencapture", "-x", "-o", "-l", window_id, path)
-            with Image.open(path) as image:
-                image.load()
-                return image.convert("RGB")
+            self._capture("-x", "-o", "-l", window_id, path)
+            return _load(path)
         except PlatformError as e:
-            raise PlatformError(f"window {window_id} couldn't be captured: {e}. {SCREEN_RECORDING_HINT}") from e
+            raise PlatformError(f"window {window_id} couldn't be captured: {e}") from e
         finally:
             os.unlink(path)
 
@@ -132,6 +177,14 @@ class MacOSPlatform(Platform):
     def send_close_tab_shortcut(self) -> None:
         self._osascript(CLOSE_TAB_SCRIPT)
 
+    def _capture(self, *args: str) -> None:
+        try:
+            self._run("screencapture", *args)
+        except PlatformError as e:
+            if not self._screen_recording_allowed():
+                raise PlatformError(f"{e}. {SCREEN_RECORDING_HINT}") from e
+            raise
+
     def _osascript(self, script: str, *args: str, timeout: float = 10) -> None:
         command = ["osascript"]
         for line in script.strip().splitlines():
@@ -143,7 +196,47 @@ class MacOSPlatform(Platform):
                 raise PlatformError(f"{e}. {ACCESSIBILITY_HINT}") from e
             raise
 
+    def _open_settings(self, pane: str) -> None:
+        try:
+            self._run("open", SETTINGS_PANES[pane], timeout=5)
+        except PlatformError:
+            pass
+
+    @staticmethod
+    def _screen_recording_allowed() -> bool:
+        preflight = getattr(Quartz, "CGPreflightScreenCaptureAccess", None)
+        return True if preflight is None else bool(preflight())
+
+    @staticmethod
+    def _display_count() -> int:
+        try:
+            error, _, count = Quartz.CGGetActiveDisplayList(MAX_DISPLAYS, None, None)
+            return max(1, int(count)) if error == 0 else 1
+        except Exception:
+            return 1
+
     @staticmethod
     def _frontmost_pid() -> int | None:
         app = NSWorkspace.sharedWorkspace().frontmostApplication()
         return int(app.processIdentifier()) if app is not None else None
+
+
+def _wait_for(check: Callable[[], bool], timeout: float = PERMISSION_WAIT_SECONDS) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if check():
+            return True
+        time.sleep(1)
+    return False
+
+
+def _temp_png() -> str:
+    fd, path = tempfile.mkstemp(prefix="focus-", suffix=".png")
+    os.close(fd)
+    return path
+
+
+def _load(path: str) -> Image.Image:
+    with Image.open(path) as image:
+        image.load()
+        return image.convert("RGB")

@@ -1,6 +1,6 @@
 [project]
 name = "focus-now"
-version = "0.2.0"
+version = "0.2.1"
 description = "An AI agent that watches your screen and keeps you on task"
 readme = "README.md"
 authors = [
@@ -15,6 +15,7 @@ dependencies = [
     "pillow>=12.3.0",
     "psutil>=7.2.2",
     "pyfiglet>=1.0.4",
+    "pyobjc-framework-ApplicationServices>=11.0 ; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=11.0 ; sys_platform == 'darwin'",
     "python-xlib>=0.33 ; sys_platform == 'linux'",
     "typer>=0.27.2",

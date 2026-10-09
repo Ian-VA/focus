@@ -1,5 +1,6 @@
 import typer
 from focus.agent.agent import AGENTS, CLOUD_PROVIDERS, DEFAULT_MODELS, LocalAgent, create_agent
+from focus.tools.platform import PlatformError, get_platform
 from focus.utils.log import warn, err, log
 
 import os
@@ -83,6 +84,11 @@ def start_focus(
 
     f = figlet_format("FOCUS!", font="slant")
     print(f)
+    try:
+        get_platform().check_permissions()
+    except PlatformError as e:
+        err(str(e))
+
     agent = create_agent(
         provider,
         model,
