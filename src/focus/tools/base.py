@@ -5,7 +5,7 @@ from typing import Any, Callable
 
 from PIL import Image
 
-# providers downscale anything larger, so bigger images only cost bandwidth and tokens
+MAX_IMAGE_PIXELS = 1_000_000
 MAX_IMAGE_EDGE = 1568
 JPEG_QUALITY = 75
 
@@ -20,7 +20,10 @@ class Screenshot:
 
     @classmethod
     def from_image(cls, image: Image.Image, label: str = "") -> "Screenshot":
-        image.thumbnail((MAX_IMAGE_EDGE, MAX_IMAGE_EDGE))
+        scale = min(1.0, (MAX_IMAGE_PIXELS / (image.width * image.height)) ** 0.5)
+        width = min(MAX_IMAGE_EDGE, int(image.width * scale))
+        height = min(MAX_IMAGE_EDGE, int(image.height * scale))
+        image.thumbnail((width, height))
         if image.mode != "RGB":
             image = image.convert("RGB")
         buffer = io.BytesIO()

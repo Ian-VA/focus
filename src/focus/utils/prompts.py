@@ -60,7 +60,7 @@ check_in = """Check-in at {time} ({elapsed} into the session).
 Your notes from recent check-ins, oldest first:
 {notes}
 
-Here is the current screen."""
+Here is the window the user is focused on. Use capture_screen with scope "full_screen" if you need to see everything that's open."""
 
 
 def build_system_prompt(task: str | None = None) -> str:

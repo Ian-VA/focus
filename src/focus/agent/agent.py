@@ -8,6 +8,7 @@ from typing import Any
 import anthropic
 import openai
 
+from focus.agent.pacing import AdaptiveInterval, ScreenWatcher
 from focus.tools import TOOLS, Screenshot, ToolResult, run_tool
 from focus.utils.log import err, log, warn
 from focus.utils.prompts import build_system_prompt, check_in
@@ -18,7 +19,6 @@ class ToolCall:
     id: str
     name: str
     args: dict[str, Any]
-    # set when the model's arguments couldn't be parsed; the call is reported back, not run
     error: str | None = None
 
 
@@ -33,23 +33,26 @@ class Turn:
 
 class BaseAgent(ABC):
     DEFAULT_MODEL: str
-    # API errors that retrying won't fix: bad key, unknown model, malformed request
     FATAL_ERRORS: tuple[type[Exception], ...] = ()
 
     def __init__(
         self,
         model: str,
-        api_key: str,
+        api_key: str | None = None,
+        base_url: str | None = None,
         task: str | None = None,
-        interval: float = 20.0,
+        interval: float = 5.0,
+        max_interval: float = 60.0,
         effort: str | None = "low",
         max_turns: int = 10,
         max_notes: int = 12,
     ):
         self.model = model
         self.api_key = api_key
+        self.base_url = base_url
         self.system_prompt = build_system_prompt(task)
-        self.interval = interval
+        self.interval = AdaptiveInterval(interval, max_interval)
+        self.watcher = ScreenWatcher(force_after=max_interval)
         self.effort = effort
         self.max_turns = max_turns
         self.notes: deque[str] = deque(maxlen=max_notes)
@@ -86,50 +89,73 @@ class BaseAgent(ABC):
 
     def prompt(self, text: str, images: list[Screenshot] | None = None) -> str:
         """send the model a prompt and let it use tools until it's done. returns its final text"""
-        conversation = self._user_message(text, images or [])
+        return self._converse(text, images or [])[0]
+
+    def _converse(self, text: str, images: list[Screenshot]) -> tuple[str, bool]:
+        """returns the model's final text and whether it used any tools along the way"""
+        conversation = self._user_message(text, images)
+        used_tools = False
 
         for _ in range(self.max_turns):
             turn = self._complete(conversation)
             if turn.stopped_early:
                 warn(turn.stopped_early)
             if turn.stopped_early or not turn.tool_calls:
-                return turn.text
+                return turn.text, used_tools
 
+            used_tools = True
             results = [(call, self.use_tool(call)) for call in turn.tool_calls]
             conversation.extend(self._tool_results(results))
 
         warn(f"check-in hit the {self.max_turns} turn limit")
-        return turn.text
+        return turn.text, used_tools
 
-    def check_in(self) -> str:
+    def check_in(self) -> str | None:
+        """look at the screen and ask the model about it if it changed. None when skipped"""
+        screen = self.capture_screen()
+        if not screen.is_error and not self.watcher.needs_check(screen.images):
+            self.interval.calm()
+            return None
+
         notes = "\n".join(f"- {note}" for note in self.notes)
         text = check_in.format(
             time=time.strftime("%H:%M:%S"),
             elapsed=_format_duration(time.time() - self.started_at),
             notes=notes or "(none yet, this is the first check-in)",
         )
-        screen = self.capture_screen()
         if screen.is_error:
             text += f"\n\n(automatic screenshot failed: {screen.text})"
 
-        summary = self.prompt(text, screen.images).strip()
+        summary, used_tools = self._converse(text, screen.images)
+        if used_tools:
+            self.interval.alert()
+            self.watcher.reset()
+        else:
+            self.interval.calm()
+
+        summary = summary.strip()
         if summary:
-            # the model's closing line is its memory for the next check-in
             self.notes.append(f"{time.strftime('%H:%M')} {summary.splitlines()[-1]}")
             log(summary)
         return summary
 
     def run(self) -> None:
-        log(f"monitoring every {self.interval:g}s with {self.model}. ctrl+c to stop")
+        log(f"monitoring every {self.interval.base:g}s with {self.model}. ctrl+c to stop")
         try:
             while True:
+                previous = self.interval.current
                 try:
                     self.check_in()
                 except self.FATAL_ERRORS as e:
                     err(f"{type(e).__name__}: {e}")
                 except Exception as e:
-                    warn(f"check-in failed, retrying next interval: {type(e).__name__}: {e}")
-                time.sleep(self.interval)
+                    detail = f"{type(e).__name__}: {e}"
+                    if e.__cause__ is not None:
+                        detail += f" (caused by {type(e.__cause__).__name__}: {e.__cause__})"
+                    warn(f"check-in failed, retrying next interval: {detail}")
+                if self.interval.current != previous:
+                    log(f"checking every {self.interval.current:g}s")
+                time.sleep(self.interval.current)
         except KeyboardInterrupt:
             log("focus session ended. nice work :)")
 
@@ -142,14 +168,12 @@ class AnthropicAgent(BaseAgent):
         anthropic.NotFoundError,
         anthropic.BadRequestError,
     )
-    # models that accept the server-side refusal fallback. screen contents are
-    # arbitrary, so a safety decline on one frame shouldn't end the check-in
     FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
     MAX_TOKENS = 16000
 
     def __init__(self, model: str = DEFAULT_MODEL, **kwargs):
         super().__init__(model=model, **kwargs)
-        self.client = anthropic.Anthropic(api_key=self.api_key)
+        self.client = anthropic.Anthropic(api_key=self.api_key, base_url=self.base_url)
         self.tools = [
             {"name": t.name, "description": t.description, "input_schema": t.parameters}
             for t in TOOLS
@@ -173,20 +197,18 @@ class AnthropicAgent(BaseAgent):
         return [{"role": "user", "content": content}]
 
     def _complete(self, conversation):
+        conversation_cache = {"cache_control": {"type": "ephemeral"}} if len(conversation) > 1 else {}
         response = self.create_message(
             model=self.model,
             max_tokens=self.MAX_TOKENS,
-            # system and tools never change, so this prefix stays cached across check-ins;
-            # the top-level cache_control caches the growing conversation within one
             system=[
                 {"type": "text", "text": self.system_prompt, "cache_control": {"type": "ephemeral"}}
             ],
-            cache_control={"type": "ephemeral"},
             tools=self.tools,
             messages=conversation,
+            **conversation_cache,
             **self.request_options,
         )
-        # append the content unchanged; thinking and fallback blocks must be sent back as-is
         conversation.append({"role": "assistant", "content": response.content})
 
         return Turn(
@@ -215,7 +237,6 @@ class AnthropicAgent(BaseAgent):
             }
             for call, result in results
         ]
-        # every result for a turn goes back in one user message
         return [{"role": "user", "content": blocks}]
 
     @staticmethod
@@ -237,7 +258,7 @@ class OpenAIAgent(BaseAgent):
 
     def __init__(self, model: str = DEFAULT_MODEL, **kwargs):
         super().__init__(model=model, **kwargs)
-        self.client = openai.OpenAI(api_key=self.api_key)
+        self.client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
         self.tools = [
             {
                 "type": "function",
@@ -251,7 +272,6 @@ class OpenAIAgent(BaseAgent):
 
         self.request_options: dict[str, Any] = {}
         if not model.startswith(("gpt-4", "gpt-3")):
-            # with store=False, reasoning carries over between turns as encrypted items
             self.request_options["include"] = ["reasoning.encrypted_content"]
             if self.effort:
                 self.request_options["reasoning"] = {"effort": self.effort}
@@ -267,7 +287,6 @@ class OpenAIAgent(BaseAgent):
             instructions=self.system_prompt,
             input=conversation,
             tools=self.tools,
-            # screenshots are private, so nothing is kept server side
             store=False,
             **self.request_options,
         )
@@ -311,10 +330,126 @@ class OpenAIAgent(BaseAgent):
         return {"type": "input_image", "image_url": shot.data_url, "detail": "high"}
 
 
+class LocalAgent(BaseAgent):
+    """a model served locally over the OpenAI chat completions protocol: ollama, lm studio, llama.cpp, vllm, ..."""
+
+    DEFAULT_MODEL = "qwen3-vl"
+    DEFAULT_BASE_URL = "http://localhost:11434/v1"
+    FATAL_ERRORS = (openai.NotFoundError, openai.BadRequestError)
+    MAX_LISTED_MODELS = 8
+
+    def __init__(self, model: str = DEFAULT_MODEL, **kwargs):
+        super().__init__(model=model, **kwargs)
+        self.base_url = self.base_url or self.DEFAULT_BASE_URL
+        self.client = openai.OpenAI(api_key=self.api_key or "local", base_url=self.base_url)
+        self.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                },
+            }
+            for t in TOOLS
+        ]
+        self._check_server()
+
+    def _check_server(self) -> None:
+        try:
+            available = {m.id for m in self.client.models.list()}
+        except openai.APIConnectionError:
+            err(
+                f"no model server answered at {self.base_url}. start one (e.g. `ollama serve`), "
+                "point [green]--base-url[/green] at yours, or use a cloud model with "
+                "[green]--provider[/green] and [green]--api-key[/green]"
+            )
+        except openai.APIError:
+            return
+
+        if available and not {self.model, f"{self.model}:latest"} & available:
+            listed = ", ".join(sorted(available)[: self.MAX_LISTED_MODELS])
+            err(
+                f"model '{self.model}' isn't available at {self.base_url}. pull it first "
+                f"(e.g. `ollama pull {self.model}`) or pick one with [green]--model[/green]: {listed}"
+            )
+
+    def _user_message(self, text, images):
+        content = [self._image(shot) for shot in images]
+        content.append({"type": "text", "text": text})
+        return [{"role": "user", "content": content}]
+
+    def _complete(self, conversation):
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "system", "content": self.system_prompt}, *conversation],
+            tools=self.tools,
+        )
+        choice = response.choices[0]
+        message = choice.message
+
+        item: dict[str, Any] = {"role": "assistant", "content": message.content or ""}
+        if message.tool_calls:
+            item["tool_calls"] = [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {"name": call.function.name, "arguments": call.function.arguments},
+                }
+                for call in message.tool_calls
+            ]
+        conversation.append(item)
+
+        return Turn(
+            text=message.content or "",
+            tool_calls=[self._parse_call(call) for call in message.tool_calls or []],
+            stopped_early={
+                "length": "the model ran out of output tokens mid-check-in",
+                "content_filter": "the model declined to review this screen",
+            }.get(choice.finish_reason),
+        )
+
+    def _tool_results(self, results):
+        items: list[dict[str, Any]] = []
+        images: list[Screenshot] = []
+        for call, result in results:
+            text = f"error: {result.text}" if result.is_error else result.text
+            items.append({"role": "tool", "tool_call_id": call.id, "content": text})
+            images.extend(result.images)
+
+        if images:
+            items.append(
+                {
+                    "role": "user",
+                    "content": [
+                        *map(self._image, images),
+                        {"type": "text", "text": "(the screenshots from the tool results above)"},
+                    ],
+                }
+            )
+        return items
+
+    @staticmethod
+    def _parse_call(call) -> ToolCall:
+        arguments = call.function.arguments
+        if isinstance(arguments, dict):
+            return ToolCall(call.id, call.function.name, arguments)
+        try:
+            return ToolCall(call.id, call.function.name, json.loads(arguments or "{}"))
+        except json.JSONDecodeError:
+            return ToolCall(call.id, call.function.name, {}, error="tool arguments were not valid JSON")
+
+    @staticmethod
+    def _image(shot: Screenshot) -> dict[str, Any]:
+        return {"type": "image_url", "image_url": {"url": shot.data_url}}
+
+
 AGENTS: dict[str, type[BaseAgent]] = {
+    "local": LocalAgent,
     "anthropic": AnthropicAgent,
     "openai": OpenAIAgent,
 }
+CLOUD_PROVIDERS = tuple(provider for provider in AGENTS if provider != "local")
 DEFAULT_MODELS = {provider: agent.DEFAULT_MODEL for provider, agent in AGENTS.items()}
 
 

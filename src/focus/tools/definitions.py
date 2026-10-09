@@ -8,20 +8,34 @@ MAX_WAIT_SECONDS = 60
 
 
 @tool(
-    "Take a screenshot of every monitor and return the images. This is your primary way "
-    "of seeing what the user is doing. Call it again after any action (closing a tab, "
-    "killing an app) to confirm the result."
+    "Take a screenshot. This is your primary way of seeing what the user is doing. "
+    "'focused_window' (the default) captures only the window the user is working in, "
+    "which is cheaper and sharper; 'full_screen' captures every monitor, for when you "
+    "need to see everything that's open. Call it again after any action (closing a tab, "
+    "killing an app) to confirm the result.",
+    schema(scope={"type": "string", "enum": ["focused_window", "full_screen"]}),
 )
-def capture_screen() -> ToolResult:
-    shots = [
-        Screenshot.from_image(image, label=f"monitor {i}")
-        for i, image in enumerate(get_platform().grab_screens(), start=1)
-    ]
-    sizes = ", ".join(f"{s.label}: {s.width}x{s.height}" for s in shots)
-    return ToolResult(
-        f"captured {len(shots)} screen(s) at {time.strftime('%H:%M:%S')} ({sizes})",
-        images=shots,
-    )
+def capture_screen(scope: str = "focused_window") -> ToolResult:
+    platform = get_platform()
+    shots, note = [], ""
+
+    if scope == "focused_window":
+        try:
+            window = platform.focused_window()
+            if window:
+                image = platform.grab_window(window.id)
+                shots = [Screenshot.from_image(image, label=f"{window.app}: {window.title}")]
+        except PlatformError as e:
+            note = f" (focused window capture failed: {e})"
+
+    if not shots:
+        shots = [
+            Screenshot.from_image(image, label=f"monitor {i}")
+            for i, image in enumerate(platform.grab_screens(), start=1)
+        ]
+
+    sizes = ", ".join(f"{s.label} ({s.width}x{s.height})" for s in shots)
+    return ToolResult(f"captured at {time.strftime('%H:%M:%S')}: {sizes}{note}", images=shots)
 
 
 @tool(

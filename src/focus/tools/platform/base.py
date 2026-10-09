@@ -1,7 +1,10 @@
+import shutil
+import subprocess
 from abc import ABC, abstractmethod
 from contextlib import suppress
 from dataclasses import dataclass
 
+import mss
 import psutil
 from PIL import Image
 
@@ -28,12 +31,15 @@ class KillReport:
 class Platform(ABC):
     name: str = "unknown"
 
-    # process names Focus must never kill, whatever the model asks. each OS fills this in
     protected_processes: frozenset[str] = frozenset()
 
     @abstractmethod
     def grab_screens(self) -> list[Image.Image]:
         """one image per monitor"""
+
+    @abstractmethod
+    def grab_window(self, window_id: str) -> Image.Image:
+        """capture a single window by the id returned from list_windows"""
 
     @abstractmethod
     def list_windows(self) -> list[WindowInfo]:
@@ -50,6 +56,9 @@ class Platform(ABC):
     @abstractmethod
     def send_close_tab_shortcut(self) -> None:
         """press the OS's close-tab shortcut (ctrl+w, cmd+w, ...) in the focused window"""
+
+    def focused_window(self) -> WindowInfo | None:
+        return next((window for window in self.list_windows() if window.focused), None)
 
     def close_tab(self, window_id: str | None = None) -> None:
         if window_id is not None:
@@ -88,6 +97,21 @@ class Platform(ABC):
 
         return KillReport(killed=_labels(targets), refused=_labels(refused))
 
+    @staticmethod
+    def _require(command: str, reason: str) -> None:
+        if not shutil.which(command):
+            raise PlatformError(f"{reason} installed")
+
+    @staticmethod
+    def _run(*cmd: str, timeout: float = 10) -> bytes:
+        try:
+            return subprocess.run(cmd, check=True, capture_output=True, timeout=timeout).stdout
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode(errors="replace").strip()
+            raise PlatformError(f"`{cmd[0]}` failed: {stderr}") from e
+        except subprocess.TimeoutExpired as e:
+            raise PlatformError(f"`{cmd[0]}` timed out") from e
+
 
 class UnsupportedPlatform(Platform):
     """placeholder for OSes that don't have an implementation yet"""
@@ -101,6 +125,9 @@ class UnsupportedPlatform(Platform):
     def grab_screens(self):
         self._unsupported()
 
+    def grab_window(self, window_id):
+        self._unsupported()
+
     def list_windows(self):
         self._unsupported()
 
@@ -112,6 +139,14 @@ class UnsupportedPlatform(Platform):
 
     def send_close_tab_shortcut(self):
         self._unsupported()
+
+
+def grab_monitors(grabber: mss.MSS) -> list[Image.Image]:
+    monitors = grabber.monitors
+    return [
+        Image.frombytes("RGB", shot.size, shot.rgb)
+        for shot in map(grabber.grab, monitors[1:] or monitors[:1])
+    ]
 
 
 def _labels(procs: list[psutil.Process]) -> list[str]:

@@ -1,5 +1,5 @@
 import typer
-from focus.agent.agent import DEFAULT_MODELS, create_agent
+from focus.agent.agent import AGENTS, CLOUD_PROVIDERS, DEFAULT_MODELS, LocalAgent, create_agent
 from focus.utils.log import warn, err, log
 
 import os
@@ -11,9 +11,21 @@ app = typer.Typer()
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
-    key: str | None = typer.Option(None, "--key", help="api key to use for Focus"),
     provider: str = typer.Option(
-        "anthropic", "--provider", help="model provider to use for Focus (anthropic, openai)"
+        "local",
+        "--provider",
+        help=f"model provider to use for Focus: local (default, any OpenAI-compatible server such as ollama), {', '.join(CLOUD_PROVIDERS)}",
+    ),
+    api_key: str | None = typer.Option(
+        None,
+        "--api-key",
+        "--api_key",
+        help=f"api key for a cloud provider. only used with --provider {' or '.join(CLOUD_PROVIDERS)}",
+    ),
+    base_url: str | None = typer.Option(
+        None,
+        "--base-url",
+        help=f"url of the model server. defaults to {LocalAgent.DEFAULT_BASE_URL} for local models and the provider's own api otherwise",
     ),
     model: str | None = typer.Option(
         None,
@@ -26,37 +38,59 @@ def main(
         help="task you wish to complete in this Focus session. without one, Focus keeps you on generally productive work",
     ),
     interval: float = typer.Option(
-        20.0, "--interval", help="seconds to wait between screen check-ins"
+        5.0,
+        "--interval",
+        help="starting seconds between screen check-ins. backs off to 60s while you stay on task",
     ),
     effort: str = typer.Option(
-        "low", "--effort", help="how hard the model thinks per check-in (low, medium, high)"
+        "low",
+        "--effort",
+        help="how hard the model thinks per check-in (low, medium, high). cloud providers only",
     ),
 ):
     if ctx.invoked_subcommand is None:
-        start_focus(provider, model, key, task, interval, effort)
+        start_focus(provider, model, api_key, base_url, task, interval, effort)
 
 
 def start_focus(
     provider: str,
     model: str | None,
-    key: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
     task: str | None = None,
-    interval: float = 20.0,
+    interval: float = 5.0,
     effort: str = "low",
 ):
-    if key == None:
-        warn("provider api key not given. searching...")
-        key = os.getenv(provider.upper() + "_API_KEY")
+    if provider not in AGENTS:
+        err(f"unknown provider '{provider}'. choose one of: {', '.join(AGENTS)}")
 
-        if key == None:
+    if provider == "local":
+        if api_key is not None:
             err(
-                "provider api key not found. please set $OPENAI_API_KEY, $ANTHROPIC_API_KEY, or pass in api_key with the [green]--key[/green] argument"
+                "an api key was given without a cloud provider. add [green]--provider[/green] "
+                f"{' or '.join(CLOUD_PROVIDERS)} to use it, or drop the key to run a local model"
+            )
+    else:
+        env_var = provider.upper() + "_API_KEY"
+        if api_key is None:
+            warn(f"api key not given with --api-key. checking ${env_var}...")
+            api_key = os.getenv(env_var)
+        if api_key is None:
+            err(
+                f"no api key for {provider}. pass it with [green]--api-key[/green] or set ${env_var}. "
+                "or drop --provider to run a local model, which needs no key"
             )
 
     f = figlet_format("FOCUS!", font="slant")
     print(f)
     agent = create_agent(
-        provider, model, api_key=key, task=task, interval=interval, effort=effort
+        provider,
+        model,
+        api_key=api_key,
+        base_url=base_url,
+        task=task,
+        interval=interval,
+        effort=effort,
     )
     log("focus is now running :)")
     agent.run()
