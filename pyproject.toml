@@ -1,7 +1,7 @@
 [project]
-name = "focus"
-version = "0.1.0"
-description = "Add your description here"
+name = "focus-now"
+version = "0.2.0"
+description = "An AI agent that watches your screen and keeps you on task"
 readme = "README.md"
 authors = [
     { name = "Ian Atroshchenko", email = "ianatroshchenko@gmail.com" }
@@ -31,3 +31,6 @@ build-backend = "uv_build"
 members = [
     "focus",
 ]
+
+[tool.uv.build-backend]
+module-name = "focus"
